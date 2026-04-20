@@ -103,7 +103,8 @@ class WatermarkApp:
             "opacity": 100.0,
             "margin": 30,
             "position": "Bottom-Left",
-            "use_sharpen": True
+            "use_sharpen": True,
+            "use_watermark": True
         }
         
         if os.path.exists(self.config_file):
@@ -130,6 +131,7 @@ class WatermarkApp:
             config["margin"] = self.margin_var.get()
             config["position"] = self.position_var.get()
             config["use_sharpen"] = self.opt_sharpen.get()
+            config["use_watermark"] = self.use_watermark_var.get()
             
         try:
             with open(self.config_file, 'w') as f:
@@ -162,7 +164,10 @@ class WatermarkApp:
         wm_text = os.path.basename(self.watermark_path) if self.watermark_path else "No watermark selected"
         wm_color = "green" if self.watermark_path else "gray"
         self.lbl_wm_status = ttk.Label(control_frame, text=wm_text, foreground=wm_color, wraplength=300)
-        self.lbl_wm_status.pack(anchor="w", pady=(0, 15))
+        self.lbl_wm_status.pack(anchor="w", pady=(0, 5))
+        self.use_watermark_var = tk.BooleanVar(value=self.config_data.get("use_watermark", True))
+        ttk.Checkbutton(control_frame, text="Apply watermark to images", variable=self.use_watermark_var,
+                        command=lambda: [self.save_config(), self.schedule_preview_update()]).pack(anchor="w", pady=(0, 15))
 
         # Step 3: Output Folder
         ttk.Label(control_frame, text="Step 3: Select Output Folder", font=("Arial", 11, "bold")).pack(anchor="w", pady=(0, 5))
@@ -365,8 +370,12 @@ class WatermarkApp:
             return
 
         i = self._load_index
+        self._load_index += 1
+        self.lbl_input_status.config(text=f"Loading {self._load_index} / {len(self.input_paths)} images...", foreground="blue")
+        self.root.update_idletasks()
+
         path = self.input_paths[i]
-        
+
         try:
             img = Image.open(path)
             img = ImageOps.exif_transpose(img)
@@ -422,9 +431,6 @@ class WatermarkApp:
             self.thumb_rects.append(None)
             self.enhance_states.append(tk.BooleanVar(value=False))
             
-        self._load_index += 1
-        self.lbl_input_status.config(text=f"Loading {self._load_index} / {len(self.input_paths)} images...", foreground="blue")
-        
         self._load_job_id = self.root.after(5, self._load_next_thumbnail)
 
     def load_watermark(self):
@@ -763,8 +769,8 @@ class WatermarkApp:
                 use_sharpen=self.opt_sharpen.get()
             )
         
-        # Apply Watermark if a watermark image is loaded
-        if self.watermark_image_orig:
+        # Apply Watermark if a watermark image is loaded and enabled
+        if self.watermark_image_orig and self.use_watermark_var.get():
             # Read UI values
             scale = self.scale_var.get() / 100.0
             opacity = self.opacity_var.get() / 100.0
@@ -800,15 +806,15 @@ class WatermarkApp:
             messagebox.showwarning("Missing Input", "Please select input images or a folder first.")
             return
             
-        has_watermark = self.watermark_image_orig is not None
+        has_watermark = self.watermark_image_orig is not None and self.use_watermark_var.get()
         any_enhanced = any(state.get() for state in self.enhance_states)
-        
+
         if not has_watermark and not any_enhanced:
             messagebox.showwarning("Nothing to do", "Please select a watermark image or choose at least one image to enhance.")
             return
-            
+
         if not has_watermark and any_enhanced:
-            if not messagebox.askyesno("No Watermark", "You haven't selected a watermark.\n\nAre you sure you want to process the images applying ONLY the enhancements?"):
+            if not messagebox.askyesno("No Watermark", "No watermark will be applied.\n\nAre you sure you want to process the images applying ONLY the enhancements?"):
                 return
                 
         if not self.output_dir:
@@ -843,6 +849,7 @@ class WatermarkApp:
         margin = self.margin_var.get()
         position = self.position_var.get()
         use_sharpen = self.opt_sharpen.get()
+        use_watermark = self.use_watermark_var.get()
 
         # Create timestamped subfolder
         # Formatting as YYYY-MM-DD HH-MM-SS to prevent OS file path errors with colons
@@ -876,7 +883,7 @@ class WatermarkApp:
                     debug_dir = current_run_out_dir if self.debug_mode else None
                     base_img = self.auto_enhance_image(base_img, use_sharpen=use_sharpen, debug_dir=debug_dir, base_filename=filename)
                     
-                if self.watermark_image_orig:
+                if self.watermark_image_orig and use_watermark:
                     result = self.apply_watermark(base_img, self.watermark_image_orig, scale, opacity, margin, position)
                 else:
                     result = base_img.copy()

@@ -6,7 +6,7 @@ import json
 import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from PIL import Image, ImageTk, ImageEnhance, ImageOps, ImageStat, ImageFilter
+from PIL import Image, ImageTk, ImageEnhance, ImageOps, ImageStat, ImageFilter, ImageDraw
 
 class Tooltip:
     """A simple tooltip class for Tkinter widgets"""
@@ -52,6 +52,26 @@ class WatermarkApp:
         self.watermark_image_orig = None
         self.tk_preview_image = None
         self.cached_base_thumb = None
+        self.per_image_manual_settings = []
+        self.manual_enabled_states = []
+
+        self.manual_setting_defs = [
+            ("brightness", "Brightness"),
+            ("contrast", "Contrast"),
+            ("gamma", "Gamma"),
+            ("color", "Color"),
+            ("sharpness", "Sharpness"),
+            ("lighting", "Lighting"),
+            ("dark_threshold", "Dark Pixel Threshold"),
+            ("bright_threshold", "Bright Pixel Threshold"),
+            ("outer_vignette", "Outer Vignette"),
+            ("inner_vignette", "Inner Vignette"),
+        ]
+        self.manual_setting_vars = {}
+        self.manual_setting_value_labels = {}
+        self.manual_setting_sliders = {}
+        self.manual_setting_reset_buttons = {}
+        self._loading_manual_settings = False
         
         # Caching and Lazy Loading
         self.cached_previews = {}  # index -> PIL Image
@@ -66,6 +86,8 @@ class WatermarkApp:
         self.enhance_states = []   # tk.BooleanVar for each image
         self.current_preview_index = 0
         self._drag_start_x = 0
+        self._pending_select_index = 0
+        self._initial_enhance_defaults = []
         
         # Incremental Loading tracking
         self._load_job_id = None
@@ -86,7 +108,11 @@ class WatermarkApp:
         # Global Keyboard Bindings
         self.root.bind("<Left>", self._on_key_left)
         self.root.bind("<Right>", self._on_key_right)
+        self.root.bind("<Down>", self._on_key_down)
         self.root.bind("<space>", self._on_key_space)
+        self.root.bind("<Delete>", self._on_key_delete)
+        self.root.bind("<m>", self._on_key_m)
+        self.root.bind("<M>", self._on_key_m)
         
         # Start background caching thread
         self.cache_thread = threading.Thread(target=self._preview_caching_worker, daemon=True)
@@ -145,101 +171,141 @@ class WatermarkApp:
         self.root.columnconfigure(1, weight=3) # Preview panel
         self.root.rowconfigure(0, weight=1)
 
-        # --- Left Panel (Controls) ---
-        control_frame = ttk.Frame(self.root, padding="15")
-        control_frame.grid(row=0, column=0, sticky="nsew")
+        # --- Left Panel (Scrollable Controls) ---
+        left_panel = ttk.Frame(self.root)
+        left_panel.grid(row=0, column=0, sticky="nsew")
+        left_panel.rowconfigure(0, weight=1)
+        left_panel.columnconfigure(0, weight=1)
 
-        # Step 1: Input Selection
-        ttk.Label(control_frame, text="Step 1: Select Images", font=("Arial", 11, "bold")).pack(anchor="w", pady=(0, 5))
-        btn_frame1 = ttk.Frame(control_frame)
+        self.controls_canvas = tk.Canvas(left_panel, highlightthickness=0)
+        self.controls_canvas.grid(row=0, column=0, sticky="nsew")
+        controls_scrollbar = ttk.Scrollbar(left_panel, orient="vertical", command=self.controls_canvas.yview)
+        controls_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
+
+        control_frame = ttk.Frame(self.controls_canvas, padding="15")
+        self._controls_window_id = self.controls_canvas.create_window((0, 0), window=control_frame, anchor="nw")
+        control_frame.bind("<Configure>", self._on_controls_frame_configure)
+        self.controls_canvas.bind("<Configure>", self._on_controls_canvas_configure)
+        self.root.bind_all("<MouseWheel>", self._on_controls_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._on_controls_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", self._on_controls_mousewheel, add="+")
+
+        step1_frame = self._create_collapsible_step(control_frame, "Step 1: Select Images")
+        btn_frame1 = ttk.Frame(step1_frame)
         btn_frame1.pack(fill="x", pady=(0, 5))
         ttk.Button(btn_frame1, text="Select Folder", command=self.load_folder).pack(side="left", fill="x", expand=True, padx=(0, 2))
         ttk.Button(btn_frame1, text="Select Files", command=self.load_files).pack(side="left", fill="x", expand=True, padx=(2, 0))
-        self.lbl_input_status = ttk.Label(control_frame, text="No images selected", foreground="gray")
-        self.lbl_input_status.pack(anchor="w", pady=(0, 15))
+        self.lbl_input_status = ttk.Label(step1_frame, text="No images selected", foreground="gray")
+        self.lbl_input_status.pack(anchor="w")
 
-        # Step 2: Watermark Selection
-        ttk.Label(control_frame, text="Step 2: Select Watermark", font=("Arial", 11, "bold")).pack(anchor="w", pady=(0, 5))
-        ttk.Button(control_frame, text="Browse Logo / Watermark", command=self.load_watermark).pack(fill="x")
-        wm_text = os.path.basename(self.watermark_path) if self.watermark_path else "No watermark selected"
-        wm_color = "green" if self.watermark_path else "gray"
-        self.lbl_wm_status = ttk.Label(control_frame, text=wm_text, foreground=wm_color, wraplength=300)
-        self.lbl_wm_status.pack(anchor="w", pady=(0, 5))
-        self.use_watermark_var = tk.BooleanVar(value=self.config_data.get("use_watermark", True))
-        ttk.Checkbutton(control_frame, text="Apply watermark to images", variable=self.use_watermark_var,
-                        command=lambda: [self.save_config(), self.schedule_preview_update()]).pack(anchor="w", pady=(0, 15))
-
-        # Step 3: Output Folder
-        ttk.Label(control_frame, text="Step 3: Select Output Folder", font=("Arial", 11, "bold")).pack(anchor="w", pady=(0, 5))
-        ttk.Button(control_frame, text="Browse Output Folder", command=self.load_output_dir).pack(fill="x")
+        step2_frame = self._create_collapsible_step(control_frame, "Step 2: Select Output Folder")
+        ttk.Button(step2_frame, text="Browse Output Folder", command=self.load_output_dir).pack(fill="x")
         out_text = self.output_dir if self.output_dir else "No output folder selected"
         out_color = "green" if self.output_dir else "gray"
-        self.lbl_out_status = ttk.Label(control_frame, text=out_text, foreground=out_color, wraplength=300)
-        self.lbl_out_status.pack(anchor="w", pady=(0, 15))
+        self.lbl_out_status = ttk.Label(step2_frame, text=out_text, foreground=out_color, wraplength=300)
+        self.lbl_out_status.pack(anchor="w", pady=(4, 0))
 
-        # Step 4: Adjustments
-        ttk.Label(control_frame, text="Step 4: Enhancements & Settings", font=("Arial", 11, "bold")).pack(anchor="w", pady=(0, 10))
-        
-        # Heavy Enhancement Toggles
-        enh_frame1 = ttk.Frame(control_frame)
-        enh_frame1.pack(fill="x", pady=(0, 15))
-        self.opt_sharpen = tk.BooleanVar(value=self.config_data.get("use_sharpen", True))
-        ttk.Checkbutton(enh_frame1, text="Advanced Crisp Sharpening", variable=self.opt_sharpen, command=lambda: [self.save_config(), self.schedule_preview_update()]).pack(side="left")
-        lbl_info1 = ttk.Label(enh_frame1, text=" ⓘ ", foreground="#0066cc", cursor="hand2", font=("Arial", 10, "bold"))
-        lbl_info1.pack(side="left")
-        Tooltip(lbl_info1, "Applies an Unsharp Mask filter to make details pop.\nDisable this if your photos are already perfectly sharp\nor if it exaggerates camera grain.")
-        
+        step3_frame = self._create_collapsible_step(control_frame, "Step 3: Select Watermark")
+        ttk.Button(step3_frame, text="Browse Logo / Watermark", command=self.load_watermark).pack(fill="x")
+        wm_text = os.path.basename(self.watermark_path) if self.watermark_path else "No watermark selected"
+        wm_color = "green" if self.watermark_path else "gray"
+        self.lbl_wm_status = ttk.Label(step3_frame, text=wm_text, foreground=wm_color, wraplength=300)
+        self.lbl_wm_status.pack(anchor="w", pady=(4, 0))
+
+        step4_frame = self._create_collapsible_step(control_frame, "Step 4: Watermark Settings")
+        self.use_watermark_var = tk.BooleanVar(value=self.config_data.get("use_watermark", True))
+        self.chk_use_watermark = ttk.Checkbutton(
+            step4_frame,
+            text="Apply watermark to images",
+            variable=self.use_watermark_var,
+            command=self._on_use_watermark_toggle
+        )
+        self.chk_use_watermark.pack(anchor="w", pady=(0, 8))
+
+        self.watermark_settings_frame = ttk.Frame(step4_frame)
+        self.watermark_settings_frame.pack(fill="x")
+
         # Scale
-        scale_header = ttk.Frame(control_frame)
+        scale_header = ttk.Frame(self.watermark_settings_frame)
         scale_header.pack(fill="x")
-        ttk.Label(scale_header, text="Watermark Size (%):").pack(side="left")
+        self.lbl_scale_title = ttk.Label(scale_header, text="Watermark Size (%):")
+        self.lbl_scale_title.pack(side="left")
         
         self.scale_var = tk.DoubleVar(value=self.config_data.get("scale", 15.0))
         self.lbl_scale_val = ttk.Label(scale_header, text=f"{self.scale_var.get():.0f}% (Default: 15)", foreground="#0066cc")
         self.lbl_scale_val.pack(side="right")
         
-        scale_slider = ttk.Scale(control_frame, from_=5.0, to=100.0, variable=self.scale_var, command=lambda v: self.on_slider_move(v, 'scale'))
-        scale_slider.pack(fill="x", pady=(0, 10))
+        self.scale_slider = ttk.Scale(self.watermark_settings_frame, from_=5.0, to=100.0, variable=self.scale_var, command=lambda v: self.on_slider_move(v, 'scale'))
+        self.scale_slider.pack(fill="x", pady=(0, 10))
 
         # Opacity
-        opacity_header = ttk.Frame(control_frame)
+        opacity_header = ttk.Frame(self.watermark_settings_frame)
         opacity_header.pack(fill="x")
-        ttk.Label(opacity_header, text="Watermark Opacity (%):").pack(side="left")
+        self.lbl_opacity_title = ttk.Label(opacity_header, text="Watermark Opacity (%):")
+        self.lbl_opacity_title.pack(side="left")
         
         self.opacity_var = tk.DoubleVar(value=self.config_data.get("opacity", 100.0))
         self.lbl_opacity_val = ttk.Label(opacity_header, text=f"{self.opacity_var.get():.0f}% (Default: 100)", foreground="#0066cc")
         self.lbl_opacity_val.pack(side="right")
         
-        opacity_slider = ttk.Scale(control_frame, from_=10.0, to=100.0, variable=self.opacity_var, command=lambda v: self.on_slider_move(v, 'opacity'))
-        opacity_slider.pack(fill="x", pady=(0, 10))
+        self.opacity_slider = ttk.Scale(self.watermark_settings_frame, from_=10.0, to=100.0, variable=self.opacity_var, command=lambda v: self.on_slider_move(v, 'opacity'))
+        self.opacity_slider.pack(fill="x", pady=(0, 10))
 
         # Margin
-        margin_header = ttk.Frame(control_frame)
+        margin_header = ttk.Frame(self.watermark_settings_frame)
         margin_header.pack(fill="x")
-        ttk.Label(margin_header, text="Margin (pixels):").pack(side="left")
+        self.lbl_margin_title = ttk.Label(margin_header, text="Margin (pixels):")
+        self.lbl_margin_title.pack(side="left")
         
         self.margin_var = tk.IntVar(value=self.config_data.get("margin", 30))
         self.lbl_margin_val = ttk.Label(margin_header, text=f"{self.margin_var.get()} px (Default: 30)", foreground="#0066cc")
         self.lbl_margin_val.pack(side="right")
         
-        margin_slider = ttk.Scale(control_frame, from_=0, to=200, variable=self.margin_var, command=lambda v: self.on_slider_move(v, 'margin'))
-        margin_slider.pack(fill="x", pady=(0, 10))
+        self.margin_slider = ttk.Scale(self.watermark_settings_frame, from_=0, to=200, variable=self.margin_var, command=lambda v: self.on_slider_move(v, 'margin'))
+        self.margin_slider.pack(fill="x", pady=(0, 10))
 
         # Position
-        ttk.Label(control_frame, text="Position:").pack(anchor="w")
+        self.lbl_position_title = ttk.Label(self.watermark_settings_frame, text="Position:")
+        self.lbl_position_title.pack(anchor="w")
         self.position_var = tk.StringVar(value=self.config_data.get("position", "Bottom-Left"))
         positions = ["Bottom-Left", "Bottom-Right", "Top-Left", "Top-Right", "Center"]
-        pos_combo = ttk.Combobox(control_frame, textvariable=self.position_var, values=positions, state="readonly")
-        pos_combo.pack(fill="x", pady=(0, 15))
-        pos_combo.bind("<<ComboboxSelected>>", lambda e: [self.save_config(), self.schedule_preview_update()])
+        self.pos_combo = ttk.Combobox(self.watermark_settings_frame, textvariable=self.position_var, values=positions, state="readonly")
+        self.pos_combo.pack(fill="x", pady=(0, 5))
+        self.pos_combo.bind("<<ComboboxSelected>>", lambda e: [self.save_config(), self.schedule_preview_update()])
 
-        # Step 5: Process
-        ttk.Label(control_frame, text="Step 5: Run", font=("Arial", 11, "bold")).pack(anchor="w", pady=(0, 5))
-        self.btn_process = ttk.Button(control_frame, text="PROCESS IMAGES (4K Max)", command=self.process_images, style="Accent.TButton")
+        step5_frame = self._create_collapsible_step(control_frame, "Step 5: Picture Enhancements")
+
+        enh_frame1 = ttk.Frame(step5_frame)
+        enh_frame1.pack(fill="x", pady=(0, 10))
+        self.opt_sharpen = tk.BooleanVar(value=self.config_data.get("use_sharpen", True))
+        ttk.Checkbutton(enh_frame1, text="Advanced Crisp Sharpening", variable=self.opt_sharpen, command=lambda: [self.save_config(), self.schedule_preview_update()]).pack(side="left")
+        lbl_info1 = ttk.Label(enh_frame1, text=" ⓘ ", foreground="#0066cc", cursor="hand2", font=("Arial", 10, "bold"))
+        lbl_info1.pack(side="left")
+        Tooltip(lbl_info1, "Applies an Unsharp Mask filter to make details pop.\nDisable this if your photos are already perfectly sharp\nor if it exaggerates camera grain.")
+
+        self.manual_settings_frame = ttk.LabelFrame(step5_frame, text="Manual Per-Image Enhance")
+        self.manual_settings_frame.pack(fill="x")
+        self.manual_mode_var = tk.BooleanVar(value=False)
+        self.chk_manual_mode = ttk.Checkbutton(
+            self.manual_settings_frame,
+            text="Manual enhancment (M)",
+            variable=self.manual_mode_var,
+            command=self.on_manual_mode_toggle,
+        )
+        self.chk_manual_mode.pack(anchor="w", pady=(0, 8))
+
+        for key, label in self.manual_setting_defs:
+            self._create_manual_setting_slider(self.manual_settings_frame, key, label)
+
+        ttk.Label(control_frame, text="Step 6: Run", font=("Arial", 11, "bold")).pack(anchor="w", pady=(0, 5))
+        step6_frame = ttk.Frame(control_frame)
+        step6_frame.pack(fill="x", pady=(0, 8))
+        self.btn_process = ttk.Button(step6_frame, text="PROCESS IMAGES (4K Max)", command=self.process_images, style="Accent.TButton")
         self.btn_process.pack(fill="x", pady=(0, 10))
         
         # Hidden Progress Area (Starts hidden)
-        self.progress_frame = ttk.Frame(control_frame)
+        self.progress_frame = ttk.Frame(step6_frame)
         self.lbl_progress_text = ttk.Label(self.progress_frame, text="0/0 pictures done", font=("Arial", 9))
         self.lbl_progress_text.pack(anchor="e")
         self.progress_var = tk.DoubleVar()
@@ -253,7 +319,13 @@ class WatermarkApp:
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(1, weight=1)
 
-        ttk.Label(preview_frame, text="Live Preview", font=("Arial", 14, "bold")).grid(row=0, column=0, pady=(0, 10))
+        preview_header = ttk.Frame(preview_frame)
+        preview_header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        preview_header.columnconfigure(0, weight=1)
+        ttk.Label(preview_header, text="Live Preview", font=("Arial", 14, "bold")).grid(row=0, column=0, sticky="w")
+        self.btn_delete = ttk.Button(preview_header, text="Delete", command=self.delete_active_image)
+        self.btn_delete.grid(row=0, column=1, sticky="e")
+        self.btn_delete.state(["disabled"])
         
         # Anti-Stutter Container: Prevents the UI from collapsing/jumping when the image is swapping
         self.preview_img_container = tk.Frame(preview_frame, bg="#e0e0e0")
@@ -277,10 +349,10 @@ class WatermarkApp:
         
         ttk.Label(self.gal_ctrl_frame, text="Enhance", font=("Arial", 11, "bold")).pack(anchor="center", pady=(0, 2))
         
-        btn_row = ttk.Frame(self.gal_ctrl_frame)
-        btn_row.pack(anchor="center")
-        ttk.Button(btn_row, text="All", width=4, command=self.check_all_enhance, takefocus=False).pack(side="left", padx=1)
-        ttk.Button(btn_row, text="None", width=4, command=self.uncheck_all_enhance, takefocus=False).pack(side="left", padx=1)
+        btn_col = ttk.Frame(self.gal_ctrl_frame)
+        btn_col.pack(anchor="center")
+        ttk.Button(btn_col, text="All", width=5, command=self.check_all_enhance, takefocus=False).pack(fill="x", padx=1)
+        ttk.Button(btn_col, text="None", width=5, command=self.uncheck_all_enhance, takefocus=False).pack(fill="x", padx=1, pady=(2, 0))
         
         ttk.Frame(self.gal_ctrl_frame).pack(expand=True) # Bottom spacer
 
@@ -302,16 +374,214 @@ class WatermarkApp:
         style = ttk.Style(self.root)
         style.configure("Stop.TButton", foreground="red", font=("Arial", 11, "bold"))
 
+        self._update_watermark_controls_state()
+        self._update_manual_controls_state()
+
+    def _create_collapsible_step(self, parent, title):
+        section_frame = ttk.Frame(parent)
+        section_frame.pack(fill="x", pady=(0, 8))
+
+        header_frame = ttk.Frame(section_frame)
+        header_frame.pack(fill="x")
+        ttk.Label(header_frame, text=title, font=("Arial", 11, "bold")).pack(side="left", anchor="w")
+
+        body_frame = ttk.Frame(section_frame)
+        is_open = tk.BooleanVar(value=True)
+
+        arrow_text = tk.StringVar()
+
+        def refresh_arrow():
+            arrow_text.set("▼" if is_open.get() else "▶")
+
+        def toggle_section():
+            if is_open.get():
+                is_open.set(False)
+                body_frame.pack_forget()
+            else:
+                is_open.set(True)
+                body_frame.pack(fill="x", pady=(4, 0))
+            refresh_arrow()
+
+        ttk.Button(header_frame, textvariable=arrow_text, command=toggle_section, width=3, takefocus=False).pack(side="right")
+        body_frame.pack(fill="x", pady=(4, 0))
+        refresh_arrow()
+        return body_frame
+
+    def _on_controls_frame_configure(self, event):
+        self.controls_canvas.configure(scrollregion=self.controls_canvas.bbox("all"))
+
+    def _on_controls_canvas_configure(self, event):
+        self.controls_canvas.itemconfigure(self._controls_window_id, width=event.width)
+
+    def _on_controls_mousewheel(self, event):
+        px = self.root.winfo_pointerx()
+        py = self.root.winfo_pointery()
+        cx = self.controls_canvas.winfo_rootx()
+        cy = self.controls_canvas.winfo_rooty()
+        cw = self.controls_canvas.winfo_width()
+        ch = self.controls_canvas.winfo_height()
+
+        if not (cx <= px <= cx + cw and cy <= py <= cy + ch):
+            return
+
+        if event.num == 4:
+            self.controls_canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.controls_canvas.yview_scroll(1, "units")
+        else:
+            self.controls_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def _create_manual_setting_slider(self, parent, key, label):
+        row = ttk.Frame(parent)
+        row.pack(fill="x")
+        ttk.Label(row, text=f"{label}:").pack(side="left")
+        reset_button = tk.Label(row, text="↻", fg="#0066cc", cursor="hand2")
+        reset_button.pack(side="left", padx=(6, 0))
+        reset_button.bind("<Button-1>", lambda e, k=key: self.on_manual_setting_reset(k))
+        value_label = ttk.Label(row, text="+0", foreground="#0066cc")
+        value_label.pack(side="right")
+
+        var = tk.DoubleVar(value=0.0)
+        slider = ttk.Scale(parent, from_=-100.0, to=100.0, variable=var, command=lambda value, k=key: self.on_manual_setting_move(k, value))
+        slider.pack(fill="x", pady=(0, 6))
+
+        self.manual_setting_vars[key] = var
+        self.manual_setting_value_labels[key] = value_label
+        self.manual_setting_sliders[key] = slider
+        self.manual_setting_reset_buttons[key] = reset_button
+
+    def _on_use_watermark_toggle(self):
+        self.save_config()
+        self._update_watermark_controls_state()
+        self.schedule_preview_update()
+
+    def _update_watermark_controls_state(self):
+        enabled = self.use_watermark_var.get()
+        slider_state = "normal" if enabled else "disabled"
+
+        self.scale_slider.configure(state=slider_state)
+        self.opacity_slider.configure(state=slider_state)
+        self.margin_slider.configure(state=slider_state)
+        if enabled:
+            self.pos_combo.state(["!disabled", "readonly"])
+        else:
+            self.pos_combo.state(["disabled"])
+
+        text_color = "#0066cc" if enabled else "gray"
+        title_color = "black" if enabled else "gray"
+        self.lbl_scale_title.configure(foreground=title_color)
+        self.lbl_opacity_title.configure(foreground=title_color)
+        self.lbl_margin_title.configure(foreground=title_color)
+        self.lbl_position_title.configure(foreground=title_color)
+        self.lbl_scale_val.configure(foreground=text_color)
+        self.lbl_opacity_val.configure(foreground=text_color)
+        self.lbl_margin_val.configure(foreground=text_color)
+
+    def _new_manual_settings(self):
+        return {key: 0.0 for key, _ in self.manual_setting_defs}
+
+    def _current_manual_mode_enabled(self):
+        if not self.input_paths:
+            return False
+        if self.current_preview_index >= len(self.manual_enabled_states):
+            return False
+        return bool(self.manual_enabled_states[self.current_preview_index])
+
+    def _current_manual_settings(self):
+        if not self.input_paths:
+            return self._new_manual_settings()
+        if self.current_preview_index >= len(self.per_image_manual_settings):
+            return self._new_manual_settings()
+        return self.per_image_manual_settings[self.current_preview_index]
+
+    def _load_manual_controls_for_current_image(self):
+        mode_enabled = self._current_manual_mode_enabled()
+        self.manual_mode_var.set(mode_enabled)
+        settings = self._current_manual_settings()
+        self._loading_manual_settings = True
+        for key, _ in self.manual_setting_defs:
+            value = float(settings.get(key, 0.0))
+            self.manual_setting_vars[key].set(value)
+            self.manual_setting_value_labels[key].configure(text=f"{value:+.0f}")
+        self._loading_manual_settings = False
+        self._update_manual_controls_state()
+
+    def _update_manual_controls_state(self):
+        has_current = bool(self.input_paths) and self.current_preview_index < len(self.per_image_manual_settings)
+        enhance_on = has_current and self.current_preview_index < len(self.enhance_states) and self.enhance_states[self.current_preview_index].get()
+        manual_on = has_current and self.current_preview_index < len(self.manual_enabled_states) and self.manual_enabled_states[self.current_preview_index]
+        enabled = bool(has_current and manual_on and enhance_on)
+
+        slider_state = "normal" if enabled else "disabled"
+        color = "#0066cc" if enabled else "gray"
+
+        if has_current:
+            self.chk_manual_mode.state(["!disabled"])
+        else:
+            self.chk_manual_mode.state(["disabled"])
+
+        for key in self.manual_setting_sliders:
+            self.manual_setting_sliders[key].configure(state=slider_state)
+            self.manual_setting_value_labels[key].configure(foreground=color)
+            if enabled:
+                self.manual_setting_reset_buttons[key].configure(fg="#0066cc", cursor="hand2")
+            else:
+                self.manual_setting_reset_buttons[key].configure(fg="gray", cursor="arrow")
+
+    def on_manual_mode_toggle(self):
+        if not self.input_paths:
+            self.manual_mode_var.set(False)
+            self._update_manual_controls_state()
+            return
+
+        if self.current_preview_index >= len(self.manual_enabled_states):
+            self._update_manual_controls_state()
+            return
+
+        self.manual_enabled_states[self.current_preview_index] = self.manual_mode_var.get()
+        self._update_manual_controls_state()
+        self.schedule_preview_update()
+
+    def on_manual_setting_reset(self, key):
+        has_current = bool(self.input_paths) and self.current_preview_index < len(self.per_image_manual_settings)
+        enhance_on = has_current and self.current_preview_index < len(self.enhance_states) and self.enhance_states[self.current_preview_index].get()
+        manual_on = has_current and self.current_preview_index < len(self.manual_enabled_states) and self.manual_enabled_states[self.current_preview_index]
+        if not (has_current and enhance_on and manual_on):
+            return
+
+        if not self.input_paths or self.current_preview_index >= len(self.per_image_manual_settings):
+            return
+
+        self._loading_manual_settings = True
+        self.manual_setting_vars[key].set(0.0)
+        self._loading_manual_settings = False
+        self.manual_setting_value_labels[key].configure(text="+0")
+        self.per_image_manual_settings[self.current_preview_index][key] = 0.0
+        self.schedule_preview_update()
+
+    def on_manual_setting_move(self, key, value):
+        numeric_value = float(value)
+        self.manual_setting_value_labels[key].configure(text=f"{numeric_value:+.0f}")
+
+        if self._loading_manual_settings:
+            return
+
+        if self.input_paths and self.current_preview_index < len(self.per_image_manual_settings):
+            self.per_image_manual_settings[self.current_preview_index][key] = numeric_value
+            self.schedule_preview_update()
+
     def check_all_enhance(self):
         """Checks all enhance checkboxes."""
         for state in self.enhance_states:
             state.set(True)
+        self._update_manual_controls_state()
         self.schedule_preview_update()
 
     def uncheck_all_enhance(self):
         """Unchecks all enhance checkboxes."""
         for state in self.enhance_states:
             state.set(False)
+        self._update_manual_controls_state()
         self.schedule_preview_update()
 
     def load_folder(self):
@@ -326,7 +596,7 @@ class WatermarkApp:
         if files:
             self._handle_input_files(files)
 
-    def _handle_input_files(self, files):
+    def _handle_input_files(self, files, enhance_defaults=None, initial_index=0):
         self.input_paths = [f for f in files if f.lower().endswith(self.valid_extensions)]
         
         # Cancel any ongoing load jobs
@@ -338,11 +608,24 @@ class WatermarkApp:
             self.lbl_input_status.config(text="No valid images found.", foreground="red")
             self.gal_canvas.delete("all")
             self.lbl_preview.config(image="", text="Load images to see preview...")
+            self.btn_delete.state(["disabled"])
+            self.per_image_manual_settings = []
+            self.manual_enabled_states = []
+            self._load_manual_controls_for_current_image()
             return
+
+        self._pending_select_index = max(0, min(initial_index, len(self.input_paths) - 1))
+        if enhance_defaults is not None and len(enhance_defaults) == len(self.input_paths):
+            self._initial_enhance_defaults = list(enhance_defaults)
+        else:
+            self._initial_enhance_defaults = [False] * len(self.input_paths)
+        self.per_image_manual_settings = [self._new_manual_settings() for _ in self.input_paths]
+        self.manual_enabled_states = [False for _ in self.input_paths]
 
         self.lbl_input_status.config(text=f"Loading 0 / {len(self.input_paths)} images...", foreground="blue")
         self.lbl_preview.config(text="Starting load...", image="")
         self.root.update_idletasks()
+        self.btn_delete.state(["!disabled"])
         
         # Reset cache and state
         self.gal_canvas.delete("all")
@@ -356,6 +639,7 @@ class WatermarkApp:
         self._x_offset = 10
         self.thumbnails_loaded = False
         self.btn_process.config(state="disabled") # Disable processing while loading
+        self._update_manual_controls_state()
         
         # Start incremental load
         self._load_next_thumbnail()
@@ -367,6 +651,7 @@ class WatermarkApp:
             self.lbl_input_status.config(text=f"Selected {len(self.input_paths)} images", foreground="green")
             self.btn_process.config(state="normal")
             self.thumbnails_loaded = True
+            self._update_manual_controls_state()
             return
 
         i = self._load_index
@@ -399,7 +684,10 @@ class WatermarkApp:
             self.thumbnails.append(tk_img)
             
             # Add to Canvas
-            self.enhance_states.append(tk.BooleanVar(value=False))
+            enhance_default = False
+            if i < len(self._initial_enhance_defaults):
+                enhance_default = self._initial_enhance_defaults[i]
+            self.enhance_states.append(tk.BooleanVar(value=enhance_default))
             
             rect_id = self.gal_canvas.create_rectangle(
                 self._x_offset - 4, 34 - thumb_img.height//2 - 4, 
@@ -423,13 +711,16 @@ class WatermarkApp:
             self._x_offset += thumb_img.width + 15
             self.gal_canvas.configure(scrollregion=(0, 0, self._x_offset, 75))
             
-            if i == 0:
-                self.select_preview_image(0)
+            if i == self._pending_select_index:
+                self.select_preview_image(i)
                 
         except Exception as e:
             print(f"Thumbnail error for {path}: {e}")
             self.thumb_rects.append(None)
-            self.enhance_states.append(tk.BooleanVar(value=False))
+            enhance_default = False
+            if i < len(self._initial_enhance_defaults):
+                enhance_default = self._initial_enhance_defaults[i]
+            self.enhance_states.append(tk.BooleanVar(value=enhance_default))
             
         self._load_job_id = self.root.after(5, self._load_next_thumbnail)
 
@@ -516,9 +807,45 @@ class WatermarkApp:
             if rect_id is not None:
                 color = "#0078D7" if i == index else "#e0e0e0"
                 self.gal_canvas.itemconfig(rect_id, outline=color)
+
+        self._ensure_active_thumbnail_visible()
+        self._load_manual_controls_for_current_image()
         
         # Pull from cache if available, otherwise generate
         self.generate_base_thumbnail()
+
+    def _ensure_active_thumbnail_visible(self):
+        if not self.thumb_rects or self.current_preview_index >= len(self.thumb_rects):
+            return
+
+        rect_id = self.thumb_rects[self.current_preview_index]
+        if rect_id is None:
+            return
+
+        rect_bbox = self.gal_canvas.bbox(rect_id)
+        all_bbox = self.gal_canvas.bbox("all")
+        if not rect_bbox or not all_bbox:
+            return
+
+        total_width = max(1, all_bbox[2] - all_bbox[0])
+        canvas_width = self.gal_canvas.winfo_width()
+        if canvas_width <= 1:
+            return
+
+        view_start, view_end = self.gal_canvas.xview()
+        view_left = view_start * total_width
+        view_right = view_end * total_width
+        max_left = max(0, total_width - canvas_width)
+        padding = 12
+
+        target_left = None
+        if rect_bbox[0] - padding < view_left:
+            target_left = max(0, rect_bbox[0] - padding)
+        elif rect_bbox[2] + padding > view_right:
+            target_left = min(max_left, rect_bbox[2] + padding - canvas_width)
+
+        if target_left is not None:
+            self.gal_canvas.xview_moveto(target_left / total_width)
 
     def _on_mousewheel(self, event):
         """Scrolls the gallery canvas using mouse wheel or trackpad."""
@@ -534,6 +861,11 @@ class WatermarkApp:
     def _on_key_right(self, event):
         if self.input_paths and self.current_preview_index < len(self.input_paths) - 1:
             self.select_preview_image(self.current_preview_index + 1)
+
+    def _on_key_down(self, event):
+        if self.input_paths and self.current_preview_index < len(self.input_paths) - 1:
+            self.select_preview_image(self.current_preview_index + 1)
+            return "break"
             
     def _on_key_space(self, event):
         # Ignore spacebar if user is interacting with a dropdown/combobox
@@ -543,11 +875,134 @@ class WatermarkApp:
         if self.input_paths and self.current_preview_index < len(self.enhance_states):
             current = self.enhance_states[self.current_preview_index].get()
             self.enhance_states[self.current_preview_index].set(not current)
+            self._update_manual_controls_state()
             self.schedule_preview_update()
             
             # Force focus back to main root to prevent double toggling if a checkbox was clicked recently
             self.root.focus_set()
             return "break" # Prevent spacebar from triggering other focused UI elements
+
+    def _on_key_m(self, event):
+        if isinstance(event.widget, ttk.Combobox):
+            return
+
+        if self.input_paths and self.current_preview_index < len(self.manual_enabled_states):
+            current = self.manual_enabled_states[self.current_preview_index]
+            self.manual_mode_var.set(not current)
+            self.on_manual_mode_toggle()
+            self.root.focus_set()
+            return "break"
+
+    def _on_key_delete(self, event):
+        if isinstance(event.widget, ttk.Combobox):
+            return
+        self.delete_active_image()
+        return "break"
+
+    def _rebuild_gallery_from_memory(self):
+        self.gal_canvas.delete("all")
+        self.thumb_rects = []
+        self._x_offset = 10
+
+        for i, tk_img in enumerate(self.thumbnails):
+            thumb_w = tk_img.width()
+            thumb_h = tk_img.height()
+
+            rect_id = self.gal_canvas.create_rectangle(
+                self._x_offset - 4, 34 - thumb_h // 2 - 4,
+                self._x_offset + thumb_w + 4, 34 + thumb_h // 2 + 4,
+                outline="#e0e0e0", width=3
+            )
+            self.thumb_rects.append(rect_id)
+
+            img_id = self.gal_canvas.create_image(self._x_offset, 34, anchor="w", image=tk_img)
+
+            chk = tk.Checkbutton(
+                self.gal_canvas,
+                variable=self.enhance_states[i],
+                command=self.schedule_preview_update,
+                bg="#e0e0e0",
+                activebackground="#e0e0e0",
+                bd=0,
+                highlightthickness=0,
+                padx=0,
+                pady=0,
+                takefocus=False,
+            )
+            self.gal_canvas.create_window(self._x_offset + thumb_w - 3, 34 - thumb_h // 2 + 3, window=chk, anchor="ne")
+
+            for item_id in (img_id, rect_id):
+                self.gal_canvas.tag_bind(item_id, "<ButtonPress-1>", self.on_gal_press)
+                self.gal_canvas.tag_bind(item_id, "<B1-Motion>", self.on_gal_drag)
+                self.gal_canvas.tag_bind(item_id, "<ButtonRelease-1>", lambda e, idx=i: self.on_thumb_click(e, idx))
+
+            self._x_offset += thumb_w + 15
+
+        self.gal_canvas.configure(scrollregion=(0, 0, max(self._x_offset, 0), 75))
+
+    def delete_active_image(self):
+        if not self.input_paths:
+            return
+
+        if not self.thumbnails_loaded:
+            messagebox.showinfo("Still loading", "Please wait until thumbnails finish loading before deleting an image.")
+            return
+
+        idx = self.current_preview_index
+
+        if self._load_job_id:
+            self.root.after_cancel(self._load_job_id)
+            self._load_job_id = None
+
+        del self.input_paths[idx]
+        if idx < len(self.enhance_states):
+            del self.enhance_states[idx]
+        if idx < len(self.thumbnails):
+            del self.thumbnails[idx]
+        if idx < len(self.per_image_manual_settings):
+            del self.per_image_manual_settings[idx]
+        if idx < len(self.manual_enabled_states):
+            del self.manual_enabled_states[idx]
+
+        with self.preview_cache_lock:
+            shifted_cache = {}
+            for cache_idx, cache_img in self.cached_previews.items():
+                if cache_idx == idx:
+                    continue
+                new_idx = cache_idx - 1 if cache_idx > idx else cache_idx
+                shifted_cache[new_idx] = cache_img
+            self.cached_previews = shifted_cache
+
+        self.cached_base_thumb = None
+        self.tk_preview_image = None
+
+        if not self.input_paths:
+            self.input_paths = []
+            self.current_preview_index = 0
+            self.cached_base_thumb = None
+            self.tk_preview_image = None
+            with self.preview_cache_lock:
+                self.cached_previews.clear()
+            self.thumbnails = []
+            self.thumb_rects = []
+            self.enhance_states = []
+            self.gal_canvas.delete("all")
+            self.gal_canvas.configure(scrollregion=(0, 0, 0, 75))
+            self.lbl_input_status.config(text="No images selected", foreground="gray")
+            self.lbl_preview.config(image="", text="Load images to see preview...", background="#e0e0e0")
+            self.btn_process.config(state="disabled")
+            self.btn_delete.state(["disabled"])
+            self.per_image_manual_settings = []
+            self.manual_enabled_states = []
+            self._load_manual_controls_for_current_image()
+            return
+
+        self.current_preview_index = min(idx, len(self.input_paths) - 1)
+        self.lbl_input_status.config(text=f"Selected {len(self.input_paths)} images", foreground="green")
+        self._rebuild_gallery_from_memory()
+        self.btn_process.config(state="normal")
+        self.btn_delete.state(["!disabled"])
+        self.select_preview_image(self.current_preview_index)
 
     def scroll_gallery(self, direction):
         self.gal_canvas.xview_scroll(direction, "units")
@@ -652,6 +1107,98 @@ class WatermarkApp:
             img.putalpha(alpha)
             
         return img
+
+    def _apply_manual_enhancements(self, img, settings):
+        if not settings:
+            return img
+
+        has_alpha = img.mode == "RGBA"
+        alpha = None
+        result = img
+        if has_alpha:
+            alpha = img.split()[3]
+            result = img.convert("RGB")
+
+        brightness = float(settings.get("brightness", 0.0))
+        contrast = float(settings.get("contrast", 0.0))
+        gamma = float(settings.get("gamma", 0.0))
+        color = float(settings.get("color", 0.0))
+        sharpness = float(settings.get("sharpness", 0.0))
+        lighting = float(settings.get("lighting", 0.0))
+        dark_threshold = float(settings.get("dark_threshold", 0.0))
+        bright_threshold = float(settings.get("bright_threshold", 0.0))
+        outer_vignette = float(settings.get("outer_vignette", 0.0))
+        inner_vignette = float(settings.get("inner_vignette", 0.0))
+
+        if abs(brightness) > 0.1:
+            result = ImageEnhance.Brightness(result).enhance(max(0.0, 1.0 + (brightness / 100.0)))
+
+        if abs(contrast) > 0.1:
+            result = ImageEnhance.Contrast(result).enhance(max(0.0, 1.0 + (contrast / 100.0)))
+
+        if abs(gamma) > 0.1:
+            gamma_factor = max(0.2, 1.0 + (gamma / 100.0))
+            result = result.point(lambda i: min(255, max(0, int(255 * ((i / 255.0) ** gamma_factor)))))
+
+        if abs(color) > 0.1:
+            result = ImageEnhance.Color(result).enhance(max(0.0, 1.0 + (color / 100.0)))
+
+        if abs(sharpness) > 0.1:
+            result = ImageEnhance.Sharpness(result).enhance(max(0.0, 1.0 + (sharpness / 100.0)))
+
+        if abs(lighting) > 0.1:
+            result = ImageEnhance.Brightness(result).enhance(max(0.2, 1.0 + (lighting / 200.0)))
+
+        if abs(dark_threshold) > 0.1 or abs(bright_threshold) > 0.1:
+            black_point = int((dark_threshold / 100.0) * 64)
+            white_point = 255 - int((bright_threshold / 100.0) * 64)
+            if white_point <= black_point + 1:
+                white_point = black_point + 2
+
+            lut = []
+            span = float(white_point - black_point)
+            for i in range(256):
+                mapped = int((i - black_point) * 255.0 / span)
+                lut.append(min(255, max(0, mapped)))
+            result = result.point(lut)
+
+        result = self._apply_vignette(result, outer_vignette, inner_vignette)
+
+        if has_alpha and alpha is not None:
+            result = result.convert("RGBA")
+            result.putalpha(alpha)
+        return result
+
+    def _apply_vignette(self, img, outer_strength, inner_strength):
+        if abs(outer_strength) <= 0.1 and abs(inner_strength) <= 0.1:
+            return img
+
+        width, height = img.size
+        mask = Image.new("L", (width, height), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.ellipse((0, 0, width, height), fill=255)
+        blur_radius = max(1, int(min(width, height) * 0.22))
+        mask = mask.filter(ImageFilter.GaussianBlur(blur_radius))
+
+        result = img
+
+        if abs(outer_strength) > 0.1:
+            if outer_strength > 0:
+                edge_factor = max(0.15, 1.0 - (outer_strength / 100.0) * 0.75)
+            else:
+                edge_factor = 1.0 + ((-outer_strength) / 100.0) * 0.75
+            edge_variant = ImageEnhance.Brightness(result).enhance(edge_factor)
+            result = Image.composite(result, edge_variant, mask)
+
+        if abs(inner_strength) > 0.1:
+            if inner_strength > 0:
+                center_factor = 1.0 + (inner_strength / 100.0) * 0.75
+            else:
+                center_factor = max(0.15, 1.0 - ((-inner_strength) / 100.0) * 0.75)
+            center_variant = ImageEnhance.Brightness(result).enhance(center_factor)
+            result = Image.composite(center_variant, result, mask)
+
+        return result
 
     def apply_watermark(self, base_image, watermark_img, scale_factor, opacity, margin, position):
         """Core logic applied to both the preview thumbnail and final high-res output"""
@@ -764,10 +1311,20 @@ class WatermarkApp:
         
         # Apply Auto-Enhance if selected FOR THIS SPECIFIC IMAGE
         if self.enhance_states[self.current_preview_index].get():
-            base_thumb = self.auto_enhance_image(
-                base_thumb, 
-                use_sharpen=self.opt_sharpen.get()
+            manual_mode_enabled = (
+                self.current_preview_index < len(self.manual_enabled_states)
+                and self.manual_enabled_states[self.current_preview_index]
             )
+            if manual_mode_enabled:
+                manual_settings = None
+                if self.current_preview_index < len(self.per_image_manual_settings):
+                    manual_settings = self.per_image_manual_settings[self.current_preview_index]
+                base_thumb = self._apply_manual_enhancements(base_thumb, manual_settings)
+            else:
+                base_thumb = self.auto_enhance_image(
+                    base_thumb,
+                    use_sharpen=self.opt_sharpen.get(),
+                )
         
         # Apply Watermark if a watermark image is loaded and enabled
         if self.watermark_image_orig and self.use_watermark_var.get():
@@ -880,8 +1437,20 @@ class WatermarkApp:
                 
                 # Apply Auto-Enhance if selected FOR THIS IMAGE
                 if i < len(self.enhance_states) and self.enhance_states[i].get():
-                    debug_dir = current_run_out_dir if self.debug_mode else None
-                    base_img = self.auto_enhance_image(base_img, use_sharpen=use_sharpen, debug_dir=debug_dir, base_filename=filename)
+                    manual_mode_enabled = i < len(self.manual_enabled_states) and self.manual_enabled_states[i]
+                    if manual_mode_enabled:
+                        manual_settings = None
+                        if i < len(self.per_image_manual_settings):
+                            manual_settings = self.per_image_manual_settings[i]
+                        base_img = self._apply_manual_enhancements(base_img, manual_settings)
+                    else:
+                        debug_dir = current_run_out_dir if self.debug_mode else None
+                        base_img = self.auto_enhance_image(
+                            base_img,
+                            use_sharpen=use_sharpen,
+                            debug_dir=debug_dir,
+                            base_filename=filename,
+                        )
                     
                 if self.watermark_image_orig and use_watermark:
                     result = self.apply_watermark(base_img, self.watermark_image_orig, scale, opacity, margin, position)
